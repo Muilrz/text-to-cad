@@ -12,6 +12,11 @@ assumptions. Do not ask the user to fill out a template.
 
 ## Reference images
 
+For reconstruction, retain the original request and images, and read the CAD
+Visual Spec when preflight is available. Resolve P0/image conflicts from visible
+evidence; P0 is a review priority, not higher truth. `$image-cad-preflight` owns
+inspection and spec validation; the modeling session keeps the original inputs.
+
 - Distinguish reproducing a part from using an image as design inspiration.
 - Establish scale from a supplied dimension or known reference when available.
   Unscaled images can guide proportions; they do not establish fit dimensions.
