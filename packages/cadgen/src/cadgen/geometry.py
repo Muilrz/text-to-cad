@@ -13,7 +13,7 @@ from math import isfinite
 from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
-    from build123d import Edge, Shape, Shell, Solid, Vector
+    from build123d import Compound, Edge, Shape, Shell, Solid, Vector
 
 __all__ = [
     "GeometryError", "GeometryIssue", "ClosestPoints", "MassProperties",
@@ -180,20 +180,49 @@ def closest_points(a: Shape, b: Shape) -> ClosestPoints:
         raise GeometryError(f"closest point computation failed: {exc}") from exc
 
 
-def overlap_volume(a: Solid, b: Solid) -> float:
-    """Intersection volume of two finite, positively oriented solids.
+def overlap_volume(a: Solid | Compound, b: Solid | Compound) -> float:
+    """Intersection volume of two finite, positively oriented solids, or of
+    compounds of them: an assembly's leaf part is often a Compound.
 
-    Contact has zero volume. Assembly pair selection, intentional overlaps
-    and acceptance thresholds belong to the caller. Inputs are never fused
-    or modified; a failed boolean is an error, never a zero-volume answer.
+    A compound is its solids, each placed as the compound places it, and the
+    answer is the sum of every pair's overlap (one solid of ``a``, one of
+    ``b``): solids of one compound that overlap each other count their shared
+    region once per solid, and are never fused. Contact has zero volume.
+    Assembly pair selection, intentional overlaps and acceptance thresholds
+    belong to the caller. Inputs are never fused or modified; a failed boolean
+    is an error, never a zero-volume answer.
     """
-    from build123d import Solid
+    lefts, rights = _solids(a), _solids(b)
+    return sum((_overlap(left, right) for left in lefts for right in rights), 0.0)
+
+
+def _solids(shape) -> list:
+    """A Solid's native solid, or a Compound's solids, each with the
+    compound's placement; ``TypeError`` for anything else, and for a compound
+    that holds no solid."""
+    from build123d import Compound, Solid
+    from OCP.TopAbs import TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
+
+    if isinstance(shape, Solid):
+        return [_wrapped(shape, Solid)]
+    if not isinstance(shape, Compound):
+        raise TypeError(f"expected Solid or Compound, got {type(shape).__name__}")
+    explorer, found = TopExp_Explorer(_wrapped(shape, Compound), TopAbs_SOLID), []
+    while explorer.More():
+        found.append(explorer.Current())
+        explorer.Next()
+    if not found:
+        raise TypeError(f"expected Solid or a Compound of solids, got a {type(shape).__name__} with no solid")
+    return found
+
+
+def _overlap(left, right) -> float:
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
     from OCP.BRepBndLib import BRepBndLib
     from OCP.BRepCheck import BRepCheck_Analyzer
     from OCP.Bnd import Bnd_Box
 
-    left, right = _wrapped(a, Solid), _wrapped(b, Solid)
     try:
         if _properties(left).Mass() <= 0 or _properties(right).Mass() <= 0:
             raise ValueError("overlap_volume requires positively oriented solids with positive volume")
@@ -265,6 +294,15 @@ def is_sound(shape: Shape) -> bool:
         raise GeometryError(f"soundness check failed: {exc}") from exc
 
 
+def _result_statuses(result) -> list:
+    """A ``BRepCheck_Result``'s own status list.
+
+    Raises ``TypeError`` where the kernel binding cannot hand the list over
+    (OCP 8 binds no ``NCollection_List<BRepCheck_Status>``); the caller then
+    asks the per-type checkers instead."""
+    return _items(result.Status())
+
+
 def topology_errors(shape: Shape) -> tuple[GeometryIssue, ...]:
     """BRepCheck topology/geometry faults, with affected owned entities.
 
@@ -273,8 +311,9 @@ def topology_errors(shape: Shape) -> tuple[GeometryIssue, ...]:
     boolean self-intersection testing are separate questions.
     """
     from OCP.BRepCheck import BRepCheck_Analyzer, BRepCheck_NoError
+    from cadgen.engine.kernel.checks import probed_statuses
     from OCP.TopExp import TopExp
-    from OCP.TopTools import TopTools_IndexedMapOfShape
+    from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 
     wrapped = _wrapped(shape)
     try:
@@ -282,7 +321,7 @@ def topology_errors(shape: Shape) -> tuple[GeometryIssue, ...]:
         analyzer = BRepCheck_Analyzer(private)
         if analyzer.IsValid():
             return ()
-        entities = TopTools_IndexedMapOfShape()
+        entities = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
         TopExp.MapShapes_s(private, entities)
         issues = []
         for i in range(1, entities.Extent() + 1):
@@ -292,17 +331,25 @@ def topology_errors(shape: Shape) -> tuple[GeometryIssue, ...]:
                 continue
             seen = set()
             def collect(statuses, context=None):
-                for status in _items(statuses):
+                for status in statuses:
                     key = (int(status), entities.FindIndex(context) if context is not None else 0)
                     if status != BRepCheck_NoError and key not in seen:
                         seen.add(key)
                         affected = (entity,) if context is None else (entity, context)
                         issues.append(GeometryIssue(status.name, tuple(_cast(s) for s in affected)))
-            collect(result.Status())
+            try:
+                statuses = _result_statuses(result)
+            except TypeError:
+                # OCP 8 binds no NCollection_List<BRepCheck_Status>, so the result's
+                # lists are unreadable there. The per-type checkers answer one
+                # question each with one status, which is enough to name the fault.
+                collect(probed_statuses(entity))
+                continue
+            collect(statuses)
             result.InitContextIterator()
             while result.MoreShapeInContext():
                 context = result.ContextualShape()
-                collect(result.StatusOnShape(context), context)
+                collect(_items(result.StatusOnShape(context)), context)
                 result.NextShapeInContext()
         if not issues:
             raise GeometryError("topology is invalid but the kernel provided no diagnostic")
@@ -321,7 +368,7 @@ def boundary_edges(shell: Shell) -> tuple[Edge, ...]:
     from OCP.ShapeAnalysis import ShapeAnalysis_Shell
     from OCP.TopAbs import TopAbs_EDGE
     from OCP.TopExp import TopExp
-    from OCP.TopTools import TopTools_IndexedMapOfShape
+    from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher
 
     wrapped = _wrapped(shell, Shell)
     try:
@@ -329,7 +376,7 @@ def boundary_edges(shell: Shell) -> tuple[Edge, ...]:
         private = _copy(wrapped)
         analyzer.LoadShells(private)
         analyzer.CheckOrientedShells(private, True)
-        edges = TopTools_IndexedMapOfShape()
+        edges = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
         TopExp.MapShapes_s(analyzer.FreeEdges(), TopAbs_EDGE, edges)
         return tuple(_cast(edges.FindKey(i)) for i in range(1, edges.Extent() + 1))
     except Exception as exc:

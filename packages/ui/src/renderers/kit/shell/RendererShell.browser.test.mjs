@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
-import { build } from 'esbuild';
+import { harnessBundle } from '../../harness/bundle.mjs';
 import { chromium } from 'playwright';
 import { PNG } from 'pngjs';
 import * as THREE from 'three';
@@ -29,18 +27,15 @@ const HARNESS_SIZE = '<style>#root > div { width: 800px !important; height: 500p
 // One harness bundle and one browser for the file; every test serves its own files and opens its
 // own page. (A browser's first WebGL page pays for compiling the viewer's shaders; later pages
 // reuse them.)
-let temporary, bundle, compiledCss, browser;
+let bundle, compiledCss, browser;
 before(async () => {
-  temporary = await mkdtemp(join(tmpdir(), 'text-to-cad-shell-browser-'));
-  await build({ entryPoints: [fileURLToPath(new URL('../../harness/index.tsx', import.meta.url))], outfile: join(temporary, 'harness.js'), bundle: true, format: 'esm', platform: 'browser', conditions: ['production'], jsx: 'automatic', loader: { '.webp': 'dataurl', '.avif': 'dataurl', '.woff2': 'dataurl', '.svg': 'dataurl' } });
-  bundle = await readFile(join(temporary, 'harness.js'));
+  ({ bundle } = await harnessBundle());
   compiledCss = await readFile(new URL('../../../../dist/styles.css', import.meta.url));
   browser = await chromium.launch({ headless: true, args: (process.platform === 'darwin' && process.env.CAD_TEST_SWIFTSHADER !== '1')
     ? ['--use-angle=metal'] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
 });
 after(async () => {
   await browser?.close();
-  if (temporary) await rm(temporary, { recursive: true, force: true });
 });
 
 /**
@@ -793,6 +788,7 @@ test('an alert the model survives is drawn over the tools, where it meets the pa
   await pane.getByRole('region', { name: 'Harness tree', exact: true }).waitFor();
   const tree = pane.locator('[data-cad-file-sidebar]');
   await pane.getByRole('separator', { name: 'Resize file sidebar', exact: true }).press('End');
+  await tree.evaluate(node => Promise.all(node.getAnimations().map(animation => animation.finished)));
   // A failed update keeps the model, and with it the tools: the card stands over both.
   await pane.locator('[data-harness-stage="failed"]').click();
   const card = pane.getByRole('alert');

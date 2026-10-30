@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
+from cadgen.engine import mesh_uri
 from cadgen.sdf_validation import raise_for_validation_errors, validate_sdf_root
 from cadgen.xml_common import duplicate_values, children, display_path, local_name
 
 SDF_SUFFIX = ".sdf"
-EXTERNAL_URI_SCHEMES = {"model", "package", "http", "https", "fuel"}
 
 
 class SdfSourceError(ValueError):
@@ -22,6 +21,11 @@ class SdfJoint:
     joint_type: str
     parent_link: str
     child_link: str
+    # Native SDF units from <axis><limit>: radians for revolute, meters for
+    # prismatic. None for joints that have no position limits (continuous, fixed)
+    # or that declare none.
+    lower: float | None = None
+    upper: float | None = None
 
 
 @dataclass(frozen=True)
@@ -43,18 +47,6 @@ def file_ref_from_sdf_path(sdf_path: Path) -> str:
     if resolved.suffix.lower() != SDF_SUFFIX:
         raise SdfSourceError(f"{resolved} is not an SDF source file")
     return display_path(resolved)
-
-
-def read_sdf_source(sdf_path: Path) -> SdfSource:
-    resolved_path = sdf_path.resolve()
-    if resolved_path.suffix.lower() != SDF_SUFFIX:
-        raise SdfSourceError(f"{resolved_path} is not an SDF source file")
-
-    try:
-        root = ET.fromstring(resolved_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ET.ParseError) as exc:
-        raise SdfSourceError(f"{display_path(resolved_path)} could not be parsed as SDF XML") from exc
-    return parse_sdf_root(root, source_path=resolved_path, base_dir=resolved_path.parent)
 
 
 def parse_sdf_xml(xml_text: str, *, source_path: Path, base_dir: Path | None = None) -> SdfSource:
@@ -125,7 +117,10 @@ def _read_model(
     source_path: Path,
     base_dir: Path,
     model_name: str,
+    prefix: str = "",
 ) -> tuple[list[str], list[SdfJoint], list[Path], list[Path]]:
+    """A model's links and joints, and those of every model nested in it under their scoped
+    names (``arm::elbow``, its parent and child scoped too), with their mesh paths."""
     link_names = [
         _required_name(link_element, source_path=source_path, label=f"model {model_name!r} link")
         for link_element in children(model_element, "link")
@@ -188,17 +183,49 @@ def _read_model(
             context=f"model {model_name!r} joint {joint_name!r} child",
             allow_world=False,
         )
+        lower, upper = _joint_position_limits(joint_element, joint_type)
         joints.append(
             SdfJoint(
-                name=joint_name,
+                name=prefix + joint_name,
                 joint_type=joint_type,
-                parent_link=parent_link,
-                child_link=child_link,
+                parent_link=parent_link if parent_link == "world" else prefix + parent_link,
+                child_link=prefix + child_link,
+                lower=lower,
+                upper=upper,
             )
         )
     _raise_on_duplicates(joint_names, source_path=source_path, label=f"model {model_name!r} joint")
 
-    return link_names, joints, visual_mesh_paths, collision_mesh_paths
+    scoped_links = [prefix + name for name in link_names]
+    for nested_element in children(model_element, "model"):
+        nested_name = _required_name(nested_element, source_path=source_path, label=f"model {model_name!r} nested model")
+        nested = _read_model(
+            nested_element,
+            source_path=source_path,
+            base_dir=base_dir,
+            model_name=f"{model_name}::{nested_name}",
+            prefix=f"{prefix}{nested_name}::",
+        )
+        scoped_links.extend(nested[0])
+        joints.extend(nested[1])
+        visual_mesh_paths.extend(nested[2])
+        collision_mesh_paths.extend(nested[3])
+    return scoped_links, joints, visual_mesh_paths, collision_mesh_paths
+
+
+def _joint_position_limits(joint_element: ET.Element, joint_type: str) -> tuple[float | None, float | None]:
+    if joint_type not in ("revolute", "prismatic"):
+        return None, None
+    for axis_element in children(joint_element, "axis"):
+        for limit_element in children(axis_element, "limit"):
+            bounds = [children(limit_element, tag) for tag in ("lower", "upper")]
+            if not all(bounds):
+                return None, None
+            try:
+                return float(str(bounds[0][0].text).strip()), float(str(bounds[1][0].text).strip())
+            except ValueError:
+                return None, None
+    return None, None
 
 
 def _required_name(element: ET.Element, *, source_path: Path, label: str) -> str:
@@ -270,14 +297,8 @@ def _geometry_mesh_paths(
 
 
 def _resolve_local_mesh_uri(uri: str, *, base_dir: Path) -> Path | None:
-    parsed = urlparse(uri)
-    if parsed.scheme in EXTERNAL_URI_SCHEMES:
-        return None
-    if parsed.scheme and parsed.scheme != "file":
-        return None
-    if parsed.scheme == "file":
-        return Path(unquote(parsed.path)).resolve()
-    return (base_dir / uri).resolve()
+    local = mesh_uri.local_path(uri)  # None for model://, package://, http(s)://, fuel://, ...
+    return None if local is None else (base_dir / local).resolve()
 
 
 def _raise_on_duplicates(values: list[str], *, source_path: Path, label: str) -> None:

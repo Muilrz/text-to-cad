@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
@@ -9,7 +8,8 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
-from cadgen.findings import FindingsReport, format_findings
+from cadgen.engine import mesh_uri
+from cadgen.findings import FindingsReport
 from cadgen.xml_common import duplicate_values, display_path
 
 URDF_SUFFIX = ".urdf"
@@ -41,10 +41,6 @@ _AXIS_UNIT_TOLERANCE = 1e-3
 
 
 class UrdfSourceError(ValueError):
-    pass
-
-
-class UrdfSourceWarning(UserWarning):
     pass
 
 
@@ -91,24 +87,6 @@ class UrdfSource:
     visual_mesh_paths: tuple[Path, ...] = ()
     collision_mesh_paths: tuple[Path, ...] = ()
     total_mass: float = 0.0
-
-
-def file_ref_from_urdf_path(urdf_path: Path) -> str:
-    resolved = urdf_path.resolve()
-    if resolved.suffix.lower() != URDF_SUFFIX:
-        raise UrdfSourceError(f"{resolved} is not a URDF source file")
-    return display_path(resolved)
-
-
-def read_urdf_source(urdf_path: Path, *, package_map: dict[str, Path] | None = None) -> UrdfSource:
-    """Compatibility wrapper: raise on the first validation error, warn on warnings."""
-    source, result = validate_urdf_file(urdf_path, package_map=package_map)
-    for finding in result.deduplicated().warnings:
-        warnings.warn(finding.message, UrdfSourceWarning, stacklevel=2)
-    if result.errors:
-        raise UrdfSourceError(format_findings(result.errors))
-    assert source is not None
-    return source
 
 
 def validate_urdf_file(
@@ -340,23 +318,26 @@ def validate_urdf_xml(
         else:
             root_link = root_candidates[0]
             visited: set[str] = set()
-            visiting: set[str] = set()
+            visiting: set[str] = {root_link}
             cycle = False
-
-            def visit(link_name: str) -> None:
-                nonlocal cycle
-                if link_name in visited or cycle:
-                    return
-                if link_name in visiting:
-                    cycle = True
-                    return
-                visiting.add(link_name)
-                for child_link in joints_by_parent.get(link_name, ()):
-                    visit(child_link)
-                visiting.discard(link_name)
-                visited.add(link_name)
-
-            visit(root_link)
+            # Depth first from the root with a stack of its own (each link and the children it has
+            # left to visit): a tree as deep as a file can write is no deeper a call.
+            stack = [(root_link, iter(joints_by_parent.get(root_link, ())))]
+            while stack and not cycle:
+                link_name, left = stack[-1]
+                for child_link in left:
+                    if child_link in visited:
+                        continue
+                    if child_link in visiting:
+                        cycle = True
+                        break
+                    visiting.add(child_link)
+                    stack.append((child_link, iter(joints_by_parent.get(child_link, ()))))
+                    break
+                else:
+                    stack.pop()
+                    visiting.discard(link_name)
+                    visited.add(link_name)
             if cycle:
                 result.add("error", "joint_graph_cycle", f"{display} joint graph contains a cycle", path="/robot")
             elif visited != link_name_set:
@@ -1408,8 +1389,9 @@ def _is_rooted(path: Path) -> bool:
 def classify_mesh_uri(uri: str) -> MeshReference:
     value = str(uri or "").strip()
     parsed = urlparse(value)
+    scheme = mesh_uri.scheme(value)  # "C:/meshes/base.stl" is a drive path, not scheme "c"
 
-    if parsed.scheme == "package":
+    if scheme == "package":
         package_name = unquote(parsed.netloc).strip()
         package_path = PurePosixPath(unquote(parsed.path).lstrip("/"))
         if not package_name or package_path.as_posix() == "." or ".." in package_path.parts:
@@ -1421,16 +1403,11 @@ def classify_mesh_uri(uri: str) -> MeshReference:
             package_path=package_path,
         )
 
-    if parsed.scheme == "file":
-        file_path = Path(unquote(parsed.path))
-        if _is_rooted(file_path):
-            return MeshReference(uri=value, kind=MeshUriKind.LOCAL_ABSOLUTE, path=file_path.resolve())
-        return MeshReference(uri=value, kind=MeshUriKind.LOCAL_RELATIVE, path=file_path)
-
-    if parsed.scheme:
+    local = mesh_uri.local_path(value)  # file:///C:/x is C:\x on Windows; file://host/... a share there
+    if local is None:
         return MeshReference(uri=value, kind=MeshUriKind.REMOTE)
 
-    local_path = Path(value)
+    local_path = Path(local)
     if _is_rooted(local_path):
         return MeshReference(uri=value, kind=MeshUriKind.LOCAL_ABSOLUTE, path=local_path.resolve())
     return MeshReference(uri=value, kind=MeshUriKind.LOCAL_RELATIVE, path=local_path)

@@ -8,9 +8,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-from tests.python.support.paths import add_repo_path
-
-add_repo_path("skills/sdf/scripts")
 
 from cadgen.cli import sdf_validate as cli
 
@@ -194,6 +191,93 @@ class SdfValidateCliTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("gz_check_passed", {issue.code for issue in result.issues})
             self.assertEqual([sdf_path], list(self.temp_root.glob("*.sdf")))
+
+    @unittest.skipUnless(os.name == "posix", "native POSIX interpreter lookup")
+    def test_a_gz_check_that_never_finishes_is_bounded_not_hung(self) -> None:
+        # A hostile document can point gz at a host that accepts but never answers.
+        # The check must return a failure within its timeout, not block the verb forever.
+        from cadgen import sdf, sdf_external
+
+        sdf_path = self._write("model.sdf", VALID_MODEL_SDF)
+        launcher = self._write("gz", "#!/bin/sh\nexec /bin/sleep 30\n")
+        launcher.chmod(0o755)
+        path = os.pathsep.join([str(self.temp_root), "/bin", "/usr/bin"])
+        with mock.patch.dict(os.environ, {"PATH": path}), \
+                mock.patch.object(sdf_external, "GZ_CHECK_TIMEOUT", 0.5):
+            result = sdf.validate(sdf_path, gz_check="required")
+        self.assertFalse(result.ok)
+        failed = [i for i in result.issues if i.code == "gz_check_failed"]
+        self.assertTrue(failed)
+        self.assertIn("did not finish", failed[0].message)
+        self.assertEqual([sdf_path], list(self.temp_root.glob("*.sdf")))  # the scratch copy is removed
+
+    @unittest.skipUnless(os.name == "posix", "native POSIX interpreter lookup")
+    def test_gz_does_not_run_on_a_document_that_names_a_remote_reference_unless_allowed(self) -> None:
+        # gz resolves a document's <include>/<uri> references itself; the document names
+        # those hosts, so gz is not run on it unless the caller lets it reach them.
+        from cadgen import sdf
+
+        ran = self.temp_root / "gz-ran"
+        launcher = self._write("gz", f"#!/bin/sh\ntouch {ran}\nexit 0\n")
+        launcher.chmod(0o755)
+        remote = VALID_WORLD_SDF.replace(
+            "</world>", "<include><uri>&#104;ttps://models.example/box</uri></include></world>")
+        sdf_path = self._write("world.sdf", remote)
+        path = os.pathsep.join([str(self.temp_root), "/bin", "/usr/bin"])
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            result = sdf.validate(sdf_path, gz_check="auto")
+            notes = [issue for issue in result.issues if issue.code == "gz_check_remote"]
+            self.assertTrue(notes)
+            self.assertEqual(notes[0].severity, "info")
+            self.assertIn("https://models.example/box", notes[0].message)
+            self.assertFalse(ran.exists())
+
+            result = sdf.validate(sdf_path, gz_check="required")
+            self.assertFalse(result.ok)
+            self.assertIn("gz_check_remote", {issue.code for issue in result.issues if issue.severity == "error"})
+            self.assertFalse(ran.exists())
+
+            result = sdf.validate(sdf_path, gz_check="required", gz_remote=True)
+            self.assertIn("gz_check_passed", {issue.code for issue in result.issues})
+            self.assertTrue(ran.exists())
+
+    def test_automatic_inertia_can_omit_computed_values(self) -> None:
+        from cadgen import sdf
+
+        for automatic in ("true", "1"):
+            with self.subTest(automatic=automatic):
+                sdf_path = self._write("auto.sdf", f"""
+                    <sdf version="1.12"><model name="automatic"><link name="base">
+                      <inertial auto="{automatic}"/>
+                      <collision name="box"><geometry><box><size>1 1 1</size></box></geometry></collision>
+                    </link></model></sdf>
+                """)
+                result = sdf.validate(sdf_path, strict=True, gz_check="never")
+                self.assertTrue(result.ok, result.issues)
+
+        sdf_path = self._write("manual.sdf", '<sdf version="1.12"><model name="manual"><link name="base"><inertial auto="false"/></link></model></sdf>')
+        result = sdf.validate(sdf_path, gz_check="never")
+        self.assertFalse(result.ok)
+        self.assertIn("missing_number", {issue.code for issue in result.issues})
+
+    def test_automatic_inertia_still_checks_explicit_input(self) -> None:
+        from cadgen import sdf
+
+        for automatic, mass, code in (
+            ("true", "-1", "invalid_mass"),
+            ("true", "nan", "invalid_number"),
+            ("sometimes", "1", "invalid_boolean"),
+            ("", "1", "invalid_boolean"),
+        ):
+            with self.subTest(automatic=automatic, mass=mass):
+                sdf_path = self._write("invalid-auto.sdf", f"""
+                    <sdf version="1.12"><model name="automatic"><link name="base">
+                      <inertial auto="{automatic}"><mass>{mass}</mass></inertial>
+                    </link></model></sdf>
+                """)
+                result = sdf.validate(sdf_path, gz_check="never")
+                self.assertFalse(result.ok)
+                self.assertIn(code, {issue.code for issue in result.issues})
 
     def test_missing_file_fails(self) -> None:
         exit_code, output = self._run(str(self.temp_root / "absent.sdf"), "--gz-check", "never")

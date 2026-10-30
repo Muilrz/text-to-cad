@@ -4,9 +4,9 @@ from collections.abc import Mapping
 import math
 from pathlib import Path
 import re
-from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
+from cadgen.engine import mesh_uri
 from cadgen.findings import FindingsReport, format_findings
 # The inertia tensor is the same physics in both formats, and this was a verbatim copy
 # of URDF's routine. Imported rather than duplicated -- a divergent eigenvalue check
@@ -222,6 +222,24 @@ def _validate_model(
     parent_targets: set[str],
     renames: bool,
 ) -> None:
+    """A model and every model nested in it, depth first in document order, walked with a stack
+    of its own: a nesting as deep as a file can write is no recursion."""
+    pending: list[tuple[ET.Element, set[str]]] = [(model_element, parent_targets)]
+    while pending:
+        element, targets = pending.pop()
+        nested = _validate_one_model(element, result, base_dir, parent_targets=targets, renames=renames)
+        pending.extend(reversed(nested))
+
+
+def _validate_one_model(
+    model_element: ET.Element,
+    result: FindingsReport,
+    base_dir: Path,
+    *,
+    parent_targets: set[str],
+    renames: bool,
+) -> list[tuple[ET.Element, set[str]]]:
+    """One model's own checks; its nested models, each with the frames it may name, to walk next."""
     model_name = _required_name(model_element, result, _path("model", model_element), "model")
     model_path = _path("model", model_element, fallback="/sdf/model")
     if not model_name:
@@ -288,7 +306,9 @@ def _validate_model(
     for link_element in link_elements:
         _validate_link(link_element, result, base_dir, local_targets, model_path)
     for joint_element in joint_elements:
-        _validate_joint(joint_element, result, link_names, local_targets, model_path)
+        # SDFormat >= 1.7: a joint's parent and child name a frame, which a link, an explicit
+        # <frame> (attached, through its chain, to a link) or the world is.
+        _validate_joint(joint_element, result, link_names | frame_names, local_targets, model_path)
     for include_element in children(model_element, "include"):
         _validate_include(include_element, result, f"{model_path}/include")
     for plugin_element in plugin_elements:
@@ -312,8 +332,7 @@ def _validate_model(
                     path=f"{model_path}/link[@name='{name}']",
                 )
 
-    for nested_model in nested_model_elements:
-        _validate_model(nested_model, result, base_dir, parent_targets=local_targets, renames=renames)
+    return [(nested_model, local_targets) for nested_model in nested_model_elements]
 
 
 def _validate_link(
@@ -558,12 +577,20 @@ def _validate_inertial(inertial_element: ET.Element, result: FindingsReport, tar
     for pose_element in children(inertial_element, "pose"):
         # Inertial pose defaults to the owning link frame (unambiguous).
         _validate_pose(pose_element, result, f"{inertial_path}/pose", targets, warn_missing_relative_to=False)
-    mass = _optional_number_child(inertial_element, "mass", result, f"{inertial_path}/mass", required=True)
+    automatic = str(inertial_element.attrib.get("auto", "false")).strip().lower()
+    if automatic not in BOOLEAN_VALUES:
+        result.add("error", "invalid_boolean", "inertial auto attribute must be boolean-like", path=inertial_path)
+    calculates_inertia = automatic in {"1", "true", "yes", "on"}
+    mass = _optional_number_child(
+        inertial_element, "mass", result, f"{inertial_path}/mass", required=not calculates_inertia,
+    )
     if mass is not None and mass <= 0:
         result.add("error", "invalid_mass", "inertial mass must be positive", path=f"{inertial_path}/mass")
 
     inertia_element = _first_child(inertial_element, "inertia")
     if inertia_element is None:
+        if calculates_inertia:
+            return
         result.add("warning", "missing_inertia_matrix", "inertial element has mass but no inertia matrix", path=inertial_path)
         return
     components: dict[str, float] = {}
@@ -699,40 +726,48 @@ def _validate_frame_cycles(
         if name and target in frame_names:
             edges[name] = target
 
-    visiting: set[str] = set()
+    # Each frame has one target, so a walk from a frame is a chain: followed with a loop, not by
+    # recursion, so a chain as long as a file can write is no deeper a call.
     visited: set[str] = set()
-
-    def visit(frame_name: str, stack: list[str]) -> None:
-        if frame_name in visited:
-            return
-        if frame_name in visiting:
-            cycle = " -> ".join([*stack, frame_name])
-            result.add("error", "frame_cycle", f"frame graph contains a cycle: {cycle}", path=f"{owner_path}/frame")
-            return
-        visiting.add(frame_name)
-        target = edges.get(frame_name)
-        if target:
-            visit(target, [*stack, frame_name])
-        visiting.remove(frame_name)
-        visited.add(frame_name)
-
-    for frame_name in edges:
-        visit(frame_name, [])
+    for start in edges:
+        chain: list[str] = []
+        on_chain: set[str] = set()
+        frame_name = start
+        while frame_name not in visited:
+            if frame_name in on_chain:
+                cycle = " -> ".join([*chain, frame_name])
+                result.add("error", "frame_cycle", f"frame graph contains a cycle: {cycle}", path=f"{owner_path}/frame")
+                break
+            on_chain.add(frame_name)
+            chain.append(frame_name)
+            frame_name = edges.get(frame_name)
+            if not frame_name:
+                break
+        visited.update(chain)
 
 
 def _validate_mesh_uri(uri: str, result: FindingsReport, base_dir: Path, uri_path: str) -> None:
-    parsed = urlparse(uri)
-    if parsed.scheme in EXTERNAL_URI_SCHEMES:
+    scheme = mesh_uri.scheme(uri)  # "C:/meshes/base.stl" is a drive path, not scheme "c"
+    if scheme in EXTERNAL_URI_SCHEMES:
         return
-    if parsed.scheme and parsed.scheme != "file":
+    local = mesh_uri.local_path(uri)
+    if local is None and scheme == "file":
         result.add(
             "warning",
-            "unresolved_mesh_uri_scheme",
-            f"mesh URI scheme {parsed.scheme!r} is not resolved by bundled validation",
+            "unresolved_mesh_uri",
+            f"mesh URI {uri!r} names a file on another host, which bundled validation does not resolve",
             path=uri_path,
         )
         return
-    mesh_path = Path(unquote(parsed.path)).resolve() if parsed.scheme == "file" else (base_dir / uri).resolve()
+    if local is None:
+        result.add(
+            "warning",
+            "unresolved_mesh_uri_scheme",
+            f"mesh URI scheme {scheme!r} is not resolved by bundled validation",
+            path=uri_path,
+        )
+        return
+    mesh_path = (base_dir / local).resolve()
     if not mesh_path.is_file():
         result.add(
             "error",
